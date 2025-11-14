@@ -253,7 +253,7 @@ class Filter:
         self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None
     ) -> dict:
         """
-        Inlet перехватывает входящие сообщения ДО отправки в LLM
+        Inlet catch user massage before LLM gei them
         """
         result = await generate_image_auto(body, __user__, __event_emitter__)
 
