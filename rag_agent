@@ -1,0 +1,395 @@
+import base64
+import re
+from typing import Optional, Any, List
+
+import aiohttp
+from pydantic import Field, BaseModel
+
+svg = """<svg
+	xmlns="http://www.w3.org/2000/svg"
+	fill="none"
+	viewBox="0 0 24 24"
+	stroke-width="1.5"
+	stroke="currentColor"
+	class="size-4"
+>
+	<path
+		stroke-linecap="round"
+		stroke-linejoin="round"
+		d="M3.75 9.776c.112-.017.227-.026.344-.026h15.812c.117 0 .232.009.344.026m-16.5 0a2.25 2.25 0 0 0-1.883 2.542l.857 6a2.25 2.25 0 0 0 2.227 1.932H19.05a2.25 2.25 0 0 0 2.227-1.932l.857-6a2.25 2.25 0 0 0-1.883-2.542m-16.5 0V6A2.25 2.25 0 0 1 6 3.75h3.879a1.5 1.5 0 0 1 1.06.44l2.122 2.12a1.5 1.5 0 0 0 1.06.44H18A2.25 2.25 0 0 1 20.25 9v.776"
+	/>
+</svg>"""
+svg = " ".join(svg.split())
+b64 = base64.b64encode(svg.encode("utf-8")).decode("utf-8")
+data_url = f"data:image/svg+xml;base64,{b64}"
+
+
+class EventEmitter:
+    """EventEmitter wrapper for Open WebUI."""
+
+    def __init__(self, event_emitter):
+        self.emit = event_emitter
+
+
+class Filter:
+    """
+    RAG filter for Open WebUI using MultiStepRAGAgent backend.
+
+    This filter intercepts user messages, performs async RAG search via
+    the FastAPI agent service, and augments the prompt with retrieved context.
+    """
+
+    class Valves(BaseModel):
+        AGENT_API_URL: str = Field(
+            default="http://your-searche-agent",
+            description="Full URL of the /agent-query endpoint",
+        )
+        PREVIEW_BASE_PATH: str = Field(
+            default="https://your-preview-service",
+            description="Base URL for file preview links",
+        )
+        SEARCH_TOOL: str = Field(
+            default="vector_search_docs",
+            description="Logical collection name (used in preview paths)",
+        )
+        COLLECTION: str = Field(default="docs", description="Colletion in qdrant")
+        MAX_ITERATIONS: int = Field(
+            default=3,
+            description="Maximum reasoning iterations for the agent",
+        )
+        EXPANSION_COUNT: int = Field(
+            default=3,
+            description="Number of query expansions to generate",
+        )
+        CONFIDENCE_THRESHOLD: float = Field(
+            default=0.5,
+            description="Minimum confidence to accept an answer",
+        )
+        SHOULD_ANSWER: bool = Field(
+            default=False,
+            description="Whether the agent should generate a final answer",
+        )
+        RAW_SEARCH: bool = Field(
+            default=True,
+            description="Whether the agent use user's query for raw search or not",
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """
+        Get or create a reusable aiohttp ClientSession.
+
+        :return: Active aiohttp session instance.
+        """
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def close(self):
+        """
+        Close the aiohttp session to free resources.
+        """
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def rag_agent_search(
+        self,
+        query: str,
+        chat_history: list,
+        emitter: Optional[EventEmitter] = None,
+    ) -> dict[str, Any]:
+        """
+        Execute a query through the MultiStepRAGAgent API.
+        :param query: User's natural language question.
+        :param emitter: Optional EventEmitter for status updates.
+        :return: Dictionary with 'answer', 'sources', and 'metadata'.
+        """
+        payload = {
+            "query": query,
+            "chat_history": chat_history,
+            "tools": [self.valves.SEARCH_TOOL],
+            "max_iterations": self.valves.MAX_ITERATIONS,
+            "expansion_count": self.valves.EXPANSION_COUNT,
+            "confidence_threshold": self.valves.CONFIDENCE_THRESHOLD,
+            "should_answer": self.valves.SHOULD_ANSWER,
+            "raw_search": self.valves.RAW_SEARCH,
+        }
+
+        try:
+            session = await self._get_session()
+            async with session.post(
+                self.valves.AGENT_API_URL,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+
+            answer = data.get("answer", "")
+            sources = data.get("sources", [])
+            metadata = data.get("metadata", {})
+            confidence = data.get("final_confidence", 0.7)
+
+            if emitter and sources:
+                await emitter.emit(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"✅ Документы найдены. Формулирую ответ...",
+                            "done": True,
+                        },
+                    }
+                )
+            elif emitter and not sources:
+                await emitter.emit(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "❌ Не найдено релевантных документов",
+                            "done": True,
+                        },
+                    }
+                )
+
+            return {
+                "answer": answer,
+                "sources": sources,
+                "metadata": metadata,
+                "confidence": confidence,
+            }
+
+        except aiohttp.ClientResponseError as e:
+            if emitter:
+                await emitter.emit(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"❌ Ошибка API: ({e.status}): {e.message}",
+                            "done": True,
+                        },
+                    }
+                )
+            return {"answer": "", "sources": [], "metadata": {}, "confidence": 0.0}
+        except Exception as e:
+            if emitter:
+                await emitter.emit(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"❌ Ошибка поиска: {type(e).__name__}: {str(e)}",
+                            "done": True,
+                        },
+                    }
+                )
+            return {"answer": "", "sources": [], "metadata": {}, "confidence": 0.0}
+
+    def clean_chunk_text(self, text: str) -> str:
+        """
+        Normalize and clean retrieved text chunks for display.
+
+        :param text: Raw text from a document.
+        :return: Cleaned text string.
+        """
+        text = text.replace("\\n", "\n")
+        text = text.replace("---", "")
+        text = text.replace('\\"', '"')
+        text = re.sub(r"\*+([^*]+)\*+", r"\1", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"-\s+", "• ", text)
+        text = re.sub(r"(?<!\b[А-Я])\.(?!\s*[А-Я])", ".\n", text)
+        text = text.replace("  ", " ")
+        return text.strip()
+
+    def _format_source_for_context(self, source: dict) -> str:
+        """
+        Format a single source document for inclusion in the RAG context.
+        :param source: Dictionary with 'content', 'source', 'relevance', etc.
+        :return: Formatted context string.
+        """
+        content = self.clean_chunk_text(source.get("content", ""))
+        src_name = source.get("source", "unknown")
+        relevance = source.get("relevance", 0.0)
+        tool = source.get("tool", "search")
+        return f"[Источник: {src_name} | Инструмент: {tool} | Релевантность: {relevance:.2f}]\n{content}"
+
+    def _get_preview_url(self, source: dict) -> str:
+        content = source.get("content", "")
+        src_name = source.get("source", "unknown")
+        page_start = source.get("page_start", 1)
+
+        if "|" in content:
+            parts = content.split("|")
+            longest = max(parts, key=len)
+            colon_parts = longest.split(":", 1)
+            snippet = colon_parts[1] if len(colon_parts) > 1 else colon_parts[0]
+        else:
+            snippet = content
+
+        snippet = snippet[:50]
+        newline_pos = snippet.find("\\\\n")
+        if newline_pos != -1:
+            snippet = snippet[:newline_pos]
+        snippet = self._trim_to_sentence_boundary(snippet)
+
+        base_url = f"{self.valves.PREVIEW_BASE_PATH}{self.valves.COLLECTION}/{src_name}"
+
+        return f"{base_url}?page={page_start}&highlight={snippet}".strip().replace(
+            " ", "%20"
+        )
+
+    def _trim_to_sentence_boundary(self, text: str) -> str:
+        dot_pos = text.rfind(".")
+
+        cap_positions = [m.start() for m in re.finditer(r" [A-ZА-ЯЁ]", text)]
+        cap_pos = cap_positions[-1] if cap_positions else -1
+
+        boundary = max(dot_pos, cap_pos)
+
+        if boundary > 0:
+            if boundary == dot_pos:
+                return text[: dot_pos + 1]
+            else:
+                return text[:cap_pos]
+
+        return text
+
+    async def inlet(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__=None,
+    ) -> dict:
+        """
+        Intercept and augment user message with RAG context.
+
+        :param body: Original request body with messages.
+        :param __user__: Optional user metadata.
+        :param __event_emitter__: Optional Open WebUI event callback.
+        :return: Modified body with augmented prompt.
+        """
+        emitter = EventEmitter(__event_emitter__)
+        messages = body.get("messages", [])
+        if not messages:
+            return body
+
+        chat_history = [
+            {"role": m["role"], "content": m["content"]}
+            for m in body.get("messages", [])[:-1]
+            if isinstance(m, dict) and "role" in m and "content" in m
+        ]
+        user_message = messages[-1].get("content", "").strip()
+        if not user_message:
+            await emitter.emit(
+                {
+                    "type": "message",
+                    "data": {
+                        "content": "⚠️ Пустой запрос, пожалуйста, напишите ваш впорос."
+                    },
+                }
+            )
+            return body
+
+        await emitter.emit(
+            {
+                "type": "status",
+                "data": {
+                    "description": "🔍 Агент ищет ответ на ваш вопрос...",
+                    "done": False,
+                },
+            }
+        )
+
+        result = await self.rag_agent_search(
+            query=user_message, chat_history=chat_history, emitter=emitter
+        )
+        sources = result.get("sources", [])
+        answer = result.get("answer", "")
+
+        if sources:
+
+            seen = set()
+            chunk_counters: dict[str, int] = {}
+            sources_block = "📚 **Найденные документы:** \n"
+
+            for src in sources:
+                src_name = src.get("source", "unknown")
+                content = src.get("content", "")
+
+                chunk_url = self._get_preview_url(src)
+                chunk_counters[src_name] = chunk_counters.get(src_name, 0) + 1
+                fragment_num = chunk_counters[src_name]
+                display_name = f"{src_name} (фрагмент {fragment_num})"
+
+                await __event_emitter__(
+                    {
+                        "type": "source",
+                        "data": {
+                            "document": [self.clean_chunk_text(content)],
+                            "metadata": [
+                                {
+                                    "source": display_name,
+                                    "tool": src.get("tool"),
+                                    "relevance": src.get("relevance"),
+                                }
+                            ],
+                            "source": {
+                                "name": display_name,  # <- chunk-level label
+                                "url": chunk_url,  # <- chunk-level URL
+                            },
+                        },
+                    }
+                )
+
+                if src_name in seen:
+                    continue
+                seen.add(src_name)
+                preview_url = self._get_preview_url(src)
+                sources_block += f"• [{src_name}]({preview_url})\n"
+
+            await emitter.emit(
+                {
+                    "type": "message",
+                    "data": {"content": "\n" + sources_block},
+                }
+            )
+
+            context_parts = [self._format_source_for_context(src) for src in sources]
+            augmented_prompt = (
+                f"Используй следующие документы для ответа на вопрос пользователя:\n\n"
+                f"{chr(10).join(context_parts)}\n\n"
+                f"Требования к ответу:\n"
+                f"- Если вопрос не релевантен документам — вежливо откажись отвечать.\n"
+                f"- Отвечай на языке вопроса.\n\n"
+                f"Вопрос пользователя: {user_message}"
+            )
+            body["messages"][-1]["content"] = augmented_prompt
+
+        else:
+            fallback_prompt = (
+                "К сожалению, по вашему запросу не найдено релевантных документов. "
+                "Если вопрос не относится к технической документации, вежливо сообщите об этом. "
+                "Не выдумывай информацию.\n\n"
+                f"Вопрос: {user_message}"
+            )
+            body["messages"][-1]["content"] = fallback_prompt
+
+        return body
+
+    async def outlet(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__=None,
+    ) -> dict:
+        """
+        Post-process LLM response (currently pass-through).
+
+        :param body: Response body from LLM.
+        :param __user__: Optional user metadata.
+        :param __event_emitter__: Optional event callback.
+        :return: Unmodified body.
+        """
+        return body
